@@ -1,0 +1,755 @@
+
+# -*- coding: utf-8 -*-
+"""
+World Cup DID (TWFE) + Parallel Trends
+(merged treated = type1 + type2 vs type0)
+=========================================================
+Main goals:
+1) Multi-scale DID overall effects on GSR (bub/500/1000/5000/10000)
+2) Build vs Post overall sustainability:
+   - Wald test: Build = Post
+   - retention ratio Post/Build
+3) Parallel trends using pre-award 5 years:
+   - Linear pretrend test: treated*t slope in pre window
+   - Event-study (treated vs control): joint lead test + figure
+
+Panel:
+- entity: id (ENTITY_COL)
+- time  : year (TIME_COL)
+- type  : 0 control, 1 co-host, 2 main host
+
+Merged treatment:
+- treated = 1 if type in {1, 2}, else 0
+
+Phases:
+- Build: [AWARD_YEAR, HOST_YEAR-1]
+- Post : [HOST_YEAR+1, HOST_YEAR+POST_HORIZON]
+- Event year excluded by design (optional)
+
+Dependencies:
+pip install pandas numpy matplotlib linearmodels
+"""
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import matplotlib.pyplot as plt
+from linearmodels.panel import PanelOLS
+
+
+# =======================
+# USER CONFIG
+# =======================
+CSV_PATH = r"bid_year_buffers.csv"
+OUT_DIR  = r"bid_year_buffers"
+
+# Key years
+AWARD_YEAR = 2004
+HOST_YEAR  = 2010
+POST_HORIZON = 5          # post-period upper bound = HOST_YEAR + POST_HORIZON
+PRE_YEARS = 5             # number of pre-award years used for parallel-trends tests
+EXCLUDE_EVENT_YEAR = True # whether to exclude the host/event year
+
+# Columns
+ENTITY_COL = "id"
+TIME_COL   = "year"
+TYPE_COL   = "type"
+
+# Outcomes (buffers)
+Y_COLS = ["GSR_bub", "GSR_500", "GSR_1000", "GSR_5000", "GSR_10000"]
+
+# Controls
+CONTROLS = ["NTL", "MAT", "AP"]
+
+# Parallel trends switches
+DO_PRETREND_LINEAR = True
+DO_EVENT_STUDY     = True
+EVENT_MAX_LAG      = POST_HORIZON
+EVENT_BASE_REL     = -1    # omitted event-study baseline period
+# =======================
+
+
+# =======================
+# Helpers
+# =======================
+def ensure_columns(dataframe: pd.DataFrame, cols: list) -> None:
+    missing = [col for col in cols if col not in dataframe.columns]
+    if missing:
+        raise KeyError(f"Missing columns in CSV: {missing}")
+
+
+def stars(p_value: float) -> str:
+    if not np.isfinite(p_value):
+        return "na"
+    if p_value < 0.01:
+        return "***"
+    if p_value < 0.05:
+        return "**"
+    if p_value < 0.10:
+        return "*"
+    return "ns"
+
+
+def stars_table(p_value: float) -> str:
+    if not np.isfinite(p_value):
+        return ""
+    if p_value < 0.01:
+        return "***"
+    if p_value < 0.05:
+        return "**"
+    if p_value < 0.10:
+        return "*"
+    return ""
+
+
+def sig_symbol(p_value: float) -> str:
+    # bracket symbol on plot: **(1%), *(5%), †(10%)
+    if not np.isfinite(p_value):
+        return ""
+    if p_value < 0.01:
+        return "**"
+    if p_value < 0.05:
+        return "*"
+    if p_value < 0.10:
+        return "†"
+    return ""
+
+
+def get_term(result, term_name: str):
+    coef = float(result.params.get(term_name, np.nan))
+    se = float(result.std_errors.get(term_name, np.nan))
+    p_value = float(result.pvalues.get(term_name, np.nan))
+    ci_low = coef - 1.96 * se
+    ci_high = coef + 1.96 * se
+    return coef, se, p_value, ci_low, ci_high
+
+
+def wald_linear(result, weights: dict):
+    """
+    Wald test for linear restriction: sum_k weights[k] * beta_k = 0
+    weights: {term_name: weight}
+    """
+    names = list(result.params.index)
+    for term_name in weights:
+        if term_name not in names:
+            return np.nan
+
+    restriction = np.zeros((1, len(names)))
+    for term_name, weight in weights.items():
+        restriction[0, names.index(term_name)] = float(weight)
+
+    try:
+        test = result.wald_test(restriction)
+        return float(test.pval)
+    except Exception:
+        return np.nan
+
+
+def wald_joint_zero(result, terms: list):
+    """
+    Joint Wald test H0: all terms == 0
+    """
+    names = list(result.params.index)
+    valid_terms = [term for term in terms if term in names]
+    if len(valid_terms) == 0:
+        return np.nan
+
+    restriction = np.zeros((len(valid_terms), len(names)))
+    for idx, term in enumerate(valid_terms):
+        restriction[idx, names.index(term)] = 1.0
+
+    try:
+        test = result.wald_test(restriction)
+        return float(test.pval)
+    except Exception:
+        return np.nan
+
+
+def fit_twfe(panel_df: pd.DataFrame, y_col: str, xcols: list):
+    model = PanelOLS(
+        panel_df[y_col].astype(float),
+        panel_df[xcols].astype(float),
+        entity_effects=True,
+        time_effects=True,
+        drop_absorbed=True,
+        check_rank=False
+    )
+    result = model.fit(cov_type="clustered", cluster_entity=True)
+    return result
+
+
+def drop_constant_or_allzero_cols(panel_df: pd.DataFrame, cols: list):
+    keep_cols = []
+    for col in cols:
+        series = panel_df[col].dropna()
+        if series.empty:
+            continue
+        if series.nunique() <= 1:
+            continue
+        keep_cols.append(col)
+    return keep_cols
+
+
+def make_full_rank_cols(panel_df: pd.DataFrame, cols: list, tol: float = 1e-10):
+    """
+    Greedy selection of linearly independent columns to avoid singular X'X.
+    Suitable for event-study.
+    """
+    if not cols:
+        return []
+
+    matrix = panel_df[cols].to_numpy(dtype=float)
+    valid_mask = np.isfinite(matrix).all(axis=1)
+    matrix = matrix[valid_mask]
+    if matrix.shape[0] == 0:
+        return []
+
+    selected_cols = []
+    current_matrix = None
+    current_rank = 0
+
+    for col_idx, col_name in enumerate(cols):
+        col_vector = matrix[:, [col_idx]]
+
+        if current_matrix is None:
+            if np.linalg.norm(col_vector) > tol:
+                selected_cols.append(col_name)
+                current_matrix = col_vector
+                current_rank = np.linalg.matrix_rank(current_matrix, tol=tol)
+            continue
+
+        trial_matrix = np.hstack([current_matrix, col_vector])
+        trial_rank = np.linalg.matrix_rank(trial_matrix, tol=tol)
+        if trial_rank > current_rank:
+            selected_cols.append(col_name)
+            current_matrix = trial_matrix
+            current_rank = trial_rank
+
+    return selected_cols
+
+
+def add_bracket(ax, x1, x2, y, text, dh=0.08, barh=0.06, fs=8):
+    y0 = y + dh
+    ax.plot([x1, x1, x2, x2], [y0, y0 + barh, y0 + barh, y0],
+            linewidth=0.8, alpha=0.9)
+    ax.text((x1 + x2) / 2, y0 + barh + dh * 0.35, text,
+            ha="center", va="bottom", fontsize=fs)
+
+
+def parse_scale_label(y_col: str) -> str:
+    if y_col.endswith("_bub"):
+        return "bub"
+    for scale in ["500", "1000", "5000", "10000"]:
+        if y_col.endswith(f"_{scale}"):
+            return f"{scale}m"
+    return y_col
+
+
+def scale_sort_key(scale_label: str) -> int:
+    order = {"bub": 0, "500m": 1, "1000m": 2, "5000m": 3, "10000m": 4}
+    return order.get(scale_label, 999)
+
+
+# =======================
+# Parallel trends (treated = type1 + type2)
+# =======================
+def pretrend_linear_test_treated(dataframe: pd.DataFrame, y_col: str):
+    """
+    Pre-award window: [AWARD_YEAR-PRE_YEARS, AWARD_YEAR-1]
+    Model: y ~ treated*t + controls + FE
+    Test: p-value of treated slope
+    """
+    pre_start = AWARD_YEAR - PRE_YEARS
+    pre_end = AWARD_YEAR - 1
+
+    subset = dataframe[(dataframe[TIME_COL] >= pre_start) & (dataframe[TIME_COL] <= pre_end)].copy()
+    if subset.empty:
+        return {"pretrend_window": f"{pre_start}-{pre_end}", "p_treated_slope": np.nan}
+
+    subset["t_pre"] = subset[TIME_COL] - pre_start
+
+    subset[TYPE_COL] = pd.to_numeric(subset[TYPE_COL], errors="coerce")
+    subset = subset.dropna(subset=[TYPE_COL])
+    subset[TYPE_COL] = subset[TYPE_COL].astype(int)
+
+    subset["treated"] = subset[TYPE_COL].isin([1, 2]).astype(int)
+    subset["T_slope"] = subset["treated"] * subset["t_pre"]
+
+    panel_df = subset.sort_values([ENTITY_COL, TIME_COL]).set_index([ENTITY_COL, TIME_COL])
+    xcols = ["T_slope"] + CONTROLS
+    panel_df = panel_df.dropna(subset=[y_col] + xcols)
+    if panel_df.empty:
+        return {"pretrend_window": f"{pre_start}-{pre_end}", "p_treated_slope": np.nan}
+
+    result = fit_twfe(panel_df, y_col, xcols)
+    p_value = float(result.pvalues.get("T_slope", np.nan))
+
+    return {"pretrend_window": f"{pre_start}-{pre_end}", "p_treated_slope": p_value}
+
+
+def event_study_treated(dataframe: pd.DataFrame, y_col: str, out_dir: Path):
+    """
+    Event study centered at AWARD_YEAR:
+    treated = 1 if type in {1,2}, control = type==0
+    rel = year - AWARD_YEAR
+
+    Include leads [-PRE_YEARS..-2] and lags [0..EVENT_MAX_LAG],
+    baseline rel = EVENT_BASE_REL (-1)
+    """
+    subset = dataframe.copy()
+    subset["rel"] = subset[TIME_COL] - AWARD_YEAR
+
+    rel_min = -PRE_YEARS
+    rel_max = EVENT_MAX_LAG
+    subset = subset[(subset["rel"] >= rel_min) & (subset["rel"] <= rel_max)].copy()
+
+    if EXCLUDE_EVENT_YEAR:
+        subset = subset[subset[TIME_COL] != HOST_YEAR].copy()
+
+    subset[TYPE_COL] = pd.to_numeric(subset[TYPE_COL], errors="coerce")
+    subset = subset.dropna(subset=[TYPE_COL])
+    subset[TYPE_COL] = subset[TYPE_COL].astype(int)
+
+    subset["treated"] = subset[TYPE_COL].isin([1, 2]).astype(int)
+
+    rel_values = list(range(rel_min, rel_max + 1))
+    if EVENT_BASE_REL in rel_values:
+        rel_values.remove(EVENT_BASE_REL)
+
+    xcols = []
+    term_map = []
+
+    for rel_value in rel_values:
+        rel_col = f"R{rel_value:+d}"
+        subset[rel_col] = (subset["rel"] == rel_value).astype(int)
+        term_name = f"T_{rel_col}"
+        subset[term_name] = subset["treated"] * subset[rel_col]
+        xcols.append(term_name)
+        term_map.append((rel_value, term_name))
+
+    xcols += CONTROLS
+
+    panel_df = subset.sort_values([ENTITY_COL, TIME_COL]).set_index([ENTITY_COL, TIME_COL])
+    panel_df = panel_df.dropna(subset=[y_col] + xcols)
+    if panel_df.empty:
+        return None
+
+    xcols_clean = drop_constant_or_allzero_cols(panel_df, xcols)
+    xcols_clean = make_full_rank_cols(panel_df, xcols_clean)
+
+    controls_kept = [col for col in CONTROLS if col in xcols_clean]
+    es_terms_kept = [col for col in xcols_clean if col not in CONTROLS]
+    xcols_clean = es_terms_kept + controls_kept
+
+    result = fit_twfe(panel_df, y_col, xcols_clean)
+
+    lead_terms = [term for rel_value, term in term_map if (rel_value <= -2 and term in result.params.index)]
+    p_leads = wald_joint_zero(result, lead_terms) if lead_terms else np.nan
+
+    rows = []
+    for rel_value, term_name in term_map:
+        if term_name not in result.params.index:
+            continue
+        coef, se, p_value, ci_low, ci_high = get_term(result, term_name)
+        rows.append({
+            "rel": rel_value,
+            "b_pp": coef * 100,
+            "lo_pp": ci_low * 100,
+            "hi_pp": ci_high * 100,
+            "p": p_value
+        })
+
+    est_df = pd.DataFrame(rows).sort_values("rel")
+
+    if est_df.empty:
+        return {"p_leads_treated": p_leads}
+
+    plt.rcParams.update({
+        "font.family": "DejaVu Sans",
+        "font.size": 9,
+        "axes.labelsize": 9,
+        "xtick.labelsize": 9,
+        "ytick.labelsize": 9,
+        "legend.fontsize": 8,
+        "axes.linewidth": 0.8,
+    })
+
+    fig, ax = plt.subplots(figsize=(4.2, 2.35))
+    ax.grid(axis="y", linewidth=0.4, alpha=0.22)
+    ax.set_axisbelow(True)
+
+    color_main = "#4C78A8"
+    xvals = est_df["rel"].to_numpy()
+    yvals = est_df["b_pp"].to_numpy()
+    lovals = est_df["lo_pp"].to_numpy()
+    hivals = est_df["hi_pp"].to_numpy()
+    yerr = np.vstack([yvals - lovals, hivals - yvals])
+
+    ax.errorbar(
+        xvals, yvals, yerr=yerr,
+        fmt="o", markersize=3.8,
+        markerfacecolor=color_main, markeredgecolor=color_main,
+        ecolor=color_main, color=color_main,
+        capsize=2.0, elinewidth=0.9, capthick=0.9,
+        linewidth=0,
+        label="treated (type1+type2)"
+    )
+    ax.plot(xvals, yvals, linewidth=0.9, alpha=0.55, color=color_main)
+
+    ax.axvline(0, linewidth=0.8, alpha=0.6)
+    ax.axhline(0, linewidth=0.8, alpha=0.6)
+    ax.set_xlabel("Event time (year - award_year)")
+    ax.set_ylabel("Effect on GSR (pp)")
+    ax.set_title(f"Event-study (treated vs control): {y_col}", fontsize=9)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(frameon=False, loc="best")
+    ax.text(0.01, 0.02, f"Lead joint test p={p_leads:.3f}",
+            transform=ax.transAxes, fontsize=8, va="bottom")
+
+    fig.tight_layout(pad=0.6)
+    safe_y = y_col.replace("/", "_")
+    fig_png = out_dir / f"{HOST_YEAR}_EventStudy_Treated_{safe_y}.png"
+    fig_pdf = out_dir / f"{HOST_YEAR}_EventStudy_Treated_{safe_y}.pdf"
+    fig.savefig(fig_png, dpi=600)
+    fig.savefig(fig_pdf)
+    plt.close(fig)
+
+    return {
+        "p_leads_treated": p_leads,
+        "eventstudy_png": str(fig_png),
+        "eventstudy_pdf": str(fig_pdf),
+    }
+
+
+# =======================
+# Two-phase DID (merged treated)
+# =======================
+def run_two_phase_merged(dataframe_raw: pd.DataFrame, y_col: str, out_dir: Path) -> dict:
+    base_cols = [ENTITY_COL, TIME_COL, TYPE_COL, y_col] + CONTROLS
+    ensure_columns(dataframe_raw, base_cols)
+
+    dataframe = dataframe_raw.copy()
+
+    dataframe[TIME_COL] = pd.to_numeric(dataframe[TIME_COL], errors="coerce").astype("Int64")
+    dataframe = dataframe.dropna(subset=[TIME_COL])
+    dataframe[TIME_COL] = dataframe[TIME_COL].astype(int)
+
+    dataframe[TYPE_COL] = pd.to_numeric(dataframe[TYPE_COL], errors="coerce").astype("Int64")
+    dataframe = dataframe.dropna(subset=[TYPE_COL])
+    dataframe[TYPE_COL] = dataframe[TYPE_COL].astype(int)
+
+    dataframe[y_col] = pd.to_numeric(dataframe[y_col], errors="coerce").clip(0, 1)
+
+    build_start = AWARD_YEAR
+    build_end = HOST_YEAR - 1
+    post_start = HOST_YEAR + 1
+    post_end = HOST_YEAR + POST_HORIZON
+
+    dataframe["build"] = ((dataframe[TIME_COL] >= build_start) & (dataframe[TIME_COL] <= build_end)).astype(int)
+    dataframe["post"] = ((dataframe[TIME_COL] >= post_start) & (dataframe[TIME_COL] <= post_end)).astype(int)
+
+    if EXCLUDE_EVENT_YEAR:
+        dataframe = dataframe[dataframe[TIME_COL] != HOST_YEAR].copy()
+
+    # merged treatment
+    dataframe["treated"] = dataframe[TYPE_COL].isin([1, 2]).astype(int)
+
+    # interactions
+    dataframe["T_build"] = dataframe["treated"] * dataframe["build"]
+    dataframe["T_post"] = dataframe["treated"] * dataframe["post"]
+
+    dataframe = dataframe.sort_values([ENTITY_COL, TIME_COL])
+    panel_df = dataframe.set_index([ENTITY_COL, TIME_COL])
+
+    xcols = ["T_build", "T_post"] + CONTROLS
+    panel_df = panel_df.dropna(subset=[y_col] + xcols)
+    if panel_df.empty:
+        raise ValueError(f"No valid rows for outcome={y_col}. Check missing values.")
+
+    result = fit_twfe(panel_df, y_col, xcols)
+
+    build_coef, build_se, build_p, build_lo, build_hi = get_term(result, "T_build")
+    post_coef, post_se, post_p, post_lo, post_hi = get_term(result, "T_post")
+
+    # within-group phase comparison
+    p_build_eq_post = wald_linear(result, {"T_build": 1, "T_post": -1})
+
+    eps = 1e-10
+    retention_ratio = (post_coef / build_coef) if np.isfinite(build_coef) and abs(build_coef) > eps else np.nan
+
+    print(f"\n=== Outcome: {y_col} ===")
+    print(f"Build: {build_start}-{build_end} | Post: {post_start}-{post_end} | EventYearExcluded={EXCLUDE_EVENT_YEAR}")
+    print("[Merged treated = type1 + type2]")
+    print(f" Build effect: {build_coef * 100:.4f} pp | p={build_p:.4f} -> {stars(build_p)}")
+    print(f" Post  effect: {post_coef * 100:.4f} pp | p={post_p:.4f} -> {stars(post_p)}")
+    print(f"[Wald: H0 Build = Post] p={p_build_eq_post:.4f} -> {stars(p_build_eq_post)}")
+    print(f"[Retention ratio = Post/Build] {retention_ratio if np.isfinite(retention_ratio) else np.nan}")
+
+    meta = {
+        "award_year": AWARD_YEAR,
+        "host_year": HOST_YEAR,
+        "post_end": HOST_YEAR + POST_HORIZON,
+        "Outcome": y_col,
+        "N": int(result.nobs),
+        "Entities": int(panel_df.index.get_level_values(0).nunique()),
+        "Years": int(panel_df.index.get_level_values(1).nunique()),
+        "Entity FE": "Yes",
+        "Year FE": "Yes",
+        "Cluster": "Entity",
+        "Controls": ", ".join(CONTROLS),
+
+        "Wald_BuildEqPost_p": p_build_eq_post,
+        "Retention_PostOverBuild": retention_ratio,
+    }
+
+    rows = [
+        {
+            **meta,
+            "Group": "Merged treated (type1+type2)",
+            "Phase": "Build",
+            "term": "T_build",
+            "Effect(pp)": build_coef * 100,
+            "SE(pp)": build_se * 100,
+            "CI95_low(pp)": build_lo * 100,
+            "CI95_high(pp)": build_hi * 100,
+            "p": build_p,
+            "Paper cell": f"{build_coef * 100:.3f}{stars_table(build_p)} ({build_se * 100:.3f})",
+        },
+        {
+            **meta,
+            "Group": "Merged treated (type1+type2)",
+            "Phase": "Post",
+            "term": "T_post",
+            "Effect(pp)": post_coef * 100,
+            "SE(pp)": post_se * 100,
+            "CI95_low(pp)": post_lo * 100,
+            "CI95_high(pp)": post_hi * 100,
+            "p": post_p,
+            "Paper cell": f"{post_coef * 100:.3f}{stars_table(post_p)} ({post_se * 100:.3f})",
+        }
+    ]
+
+    out_long = pd.DataFrame(rows)
+    out_wide = out_long.pivot(index=["Outcome", "Group"], columns="Phase", values="Paper cell").reset_index()
+
+    safe_y = y_col.replace("/", "_")
+    long_csv = out_dir / f"{HOST_YEAR}_TwoPhaseMerged_LONG_{safe_y}.csv"
+    wide_csv = out_dir / f"{HOST_YEAR}_TwoPhaseMerged_WIDE_{safe_y}.csv"
+    stat_csv = out_dir / f"{HOST_YEAR}_TwoPhaseMerged_STATS_{safe_y}.csv"
+
+    out_long.to_csv(long_csv, index=False, encoding="utf-8-sig")
+    out_wide.to_csv(wide_csv, index=False, encoding="utf-8-sig")
+    pd.DataFrame([meta]).to_csv(stat_csv, index=False, encoding="utf-8-sig")
+
+    # plot
+    plt.rcParams.update({
+        "font.family": "DejaVu Sans",
+        "font.size": 9,
+        "axes.labelsize": 9,
+        "xtick.labelsize": 9,
+        "ytick.labelsize": 9,
+        "legend.fontsize": 8,
+        "axes.linewidth": 0.8,
+    })
+
+    phase_order = ["Build", "Post"]
+    plot_df = out_long.copy()
+    plot_df["Phase"] = pd.Categorical(plot_df["Phase"], categories=phase_order, ordered=True)
+    plot_df = plot_df.sort_values("Phase")
+
+    x = np.arange(2)
+    build_label = f"Build ({build_start}–{build_end})"
+    post_label = f"Post ({post_start}–{post_end})"
+
+    yvals = plot_df["Effect(pp)"].to_numpy()
+    lovals = plot_df["CI95_low(pp)"].to_numpy()
+    hivals = plot_df["CI95_high(pp)"].to_numpy()
+    yerr = np.vstack([yvals - lovals, hivals - yvals])
+
+    color_main = "#4C78A8"
+
+    fig, ax = plt.subplots(figsize=(3.35, 2.25))
+    ax.grid(axis="y", linewidth=0.4, alpha=0.22)
+    ax.set_axisbelow(True)
+
+    ax.errorbar(
+        x, yvals, yerr=yerr,
+        fmt="o", markersize=4.2,
+        markerfacecolor=color_main, markeredgecolor=color_main,
+        ecolor=color_main, color=color_main,
+        capsize=2.0, elinewidth=0.9, capthick=0.9,
+        linewidth=0, label="treated (type1+type2)"
+    )
+    ax.plot(x, yvals, linewidth=0.9, alpha=0.55, color=color_main)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([build_label, post_label])
+    ax.set_ylabel("Effect on GSR (pp)")
+    ax.set_title(y_col, fontsize=9)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(frameon=False, loc="best")
+
+    phase_sig = sig_symbol(p_build_eq_post)
+    if phase_sig:
+        y_bracket = float(np.nanmax(hivals))
+        add_bracket(ax, x[0], x[1], y_bracket, phase_sig, dh=0.10, barh=0.08, fs=8)
+
+    fig.tight_layout(pad=0.6)
+    fig_png = out_dir / f"{HOST_YEAR}_TwoPhaseMerged_Effects_{safe_y}.png"
+    fig_pdf = out_dir / f"{HOST_YEAR}_TwoPhaseMerged_Effects_{safe_y}.pdf"
+    fig.savefig(fig_png, dpi=600)
+    fig.savefig(fig_pdf)
+    plt.close(fig)
+
+    return {
+        "Outcome": y_col,
+        "Scale": parse_scale_label(y_col),
+
+        "Build_pp": build_coef * 100,
+        "Post_pp": post_coef * 100,
+        "Build_p": build_p,
+        "Post_p": post_p,
+        "Wald_BuildEqPost_p": p_build_eq_post,
+        "Retention_PostOverBuild": retention_ratio,
+
+        "TwoPhase_LONG": str(long_csv),
+        "TwoPhase_WIDE": str(wide_csv),
+        "TwoPhase_STATS": str(stat_csv),
+        "TwoPhase_FIG_PNG": str(fig_png),
+        "TwoPhase_FIG_PDF": str(fig_pdf),
+    }
+
+
+def plot_scale_heterogeneity(summary_df: pd.DataFrame, out_dir: Path):
+    if summary_df.empty:
+        return
+
+    dataframe = summary_df.copy()
+    dataframe["ScaleOrder"] = dataframe["Scale"].apply(scale_sort_key)
+    dataframe = dataframe.sort_values("ScaleOrder")
+
+    x = np.arange(len(dataframe))
+    labels = dataframe["Scale"].tolist()
+    color_main = "#4C78A8"
+
+    # Build
+    fig, ax = plt.subplots(figsize=(4.3, 2.35))
+    ax.grid(axis="y", linewidth=0.4, alpha=0.22)
+    ax.set_axisbelow(True)
+    ax.plot(x, dataframe["Build_pp"], marker="o", linewidth=0.9, alpha=0.75,
+            color=color_main, label="treated Build")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("Effect (pp)")
+    ax.set_title("Scale heterogeneity: Build", fontsize=9)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(frameon=False, loc="best")
+    fig.tight_layout(pad=0.6)
+    fig.savefig(out_dir / f"{HOST_YEAR}_ScaleHeterogeneityMerged_Build.png", dpi=600)
+    fig.savefig(out_dir / f"{HOST_YEAR}_ScaleHeterogeneityMerged_Build.pdf")
+    plt.close(fig)
+
+    # Post
+    fig, ax = plt.subplots(figsize=(4.3, 2.35))
+    ax.grid(axis="y", linewidth=0.4, alpha=0.22)
+    ax.set_axisbelow(True)
+    ax.plot(x, dataframe["Post_pp"], marker="o", linewidth=0.9, alpha=0.75,
+            color=color_main, label="treated Post")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("Effect (pp)")
+    ax.set_title("Scale heterogeneity: Post", fontsize=9)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(frameon=False, loc="best")
+    fig.tight_layout(pad=0.6)
+    fig.savefig(out_dir / f"{HOST_YEAR}_ScaleHeterogeneityMerged_Post.png", dpi=600)
+    fig.savefig(out_dir / f"{HOST_YEAR}_ScaleHeterogeneityMerged_Post.pdf")
+    plt.close(fig)
+
+
+# =======================
+# Main
+# =======================
+def main():
+    input_path = Path(CSV_PATH)
+    if not input_path.exists():
+        raise FileNotFoundError(input_path)
+
+    out_dir = Path(OUT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    dataframe = pd.read_csv(input_path)
+
+    ensure_columns(dataframe, [ENTITY_COL, TIME_COL, TYPE_COL] + CONTROLS)
+
+    summary_rows = []
+    pretrend_rows = []
+    event_rows = []
+
+    for y_col in Y_COLS:
+        ensure_columns(dataframe, [y_col])
+
+        # 1) Two-phase DID (merged treated)
+        summary = run_two_phase_merged(dataframe, y_col, out_dir)
+        summary_rows.append(summary)
+
+        # 2) Pretrend linear test
+        if DO_PRETREND_LINEAR:
+            pt = pretrend_linear_test_treated(dataframe, y_col)
+            pretrend_rows.append({
+                "Outcome": y_col,
+                "Scale": parse_scale_label(y_col),
+                **pt
+            })
+
+        # 3) Event-study
+        if DO_EVENT_STUDY:
+            es = event_study_treated(dataframe, y_col, out_dir)
+            if es is not None:
+                event_rows.append({
+                    "Outcome": y_col,
+                    "Scale": parse_scale_label(y_col),
+                    **es
+                })
+
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df["ScaleOrder"] = summary_df["Scale"].apply(scale_sort_key)
+    summary_df = summary_df.sort_values("ScaleOrder").drop(columns=["ScaleOrder"])
+
+    summary_csv = out_dir / f"{HOST_YEAR}_TwoPhaseMerged_Summary_ALL.csv"
+    summary_df.to_csv(summary_csv, index=False, encoding="utf-8-sig")
+
+    plot_scale_heterogeneity(summary_df, out_dir)
+
+    if pretrend_rows:
+        pre_df = pd.DataFrame(pretrend_rows)
+        pre_df["ScaleOrder"] = pre_df["Scale"].apply(scale_sort_key)
+        pre_df = pre_df.sort_values("ScaleOrder").drop(columns=["ScaleOrder"])
+        pre_csv = out_dir / f"{HOST_YEAR}_Pretrend_Linear_TreatedVsControl_ALL.csv"
+        pre_df.to_csv(pre_csv, index=False, encoding="utf-8-sig")
+        print("Saved pretrend linear summary:", pre_csv)
+
+    if event_rows:
+        es_df = pd.DataFrame(event_rows)
+        es_df["ScaleOrder"] = es_df["Scale"].apply(scale_sort_key)
+        es_df = es_df.sort_values("ScaleOrder").drop(columns=["ScaleOrder"])
+        es_csv = out_dir / f"{HOST_YEAR}_EventStudy_TreatedVsControl_Summary_ALL.csv"
+        es_df.to_csv(es_csv, index=False, encoding="utf-8-sig")
+        print("Saved event-study summary:", es_csv)
+
+    print("\n=== ALL DONE ===")
+    print("Merged two-phase summary:", summary_csv)
+    print("Scale plots saved:")
+    print(" -", out_dir / f"{HOST_YEAR}_ScaleHeterogeneityMerged_Build.png")
+    print(" -", out_dir / f"{HOST_YEAR}_ScaleHeterogeneityMerged_Post.png")
+
+
+if __name__ == "__main__":
+    main()

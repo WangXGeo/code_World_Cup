@@ -2,11 +2,8 @@
 
 This repository contains the official code for the paper:
 
-**"[Your Paper Title]"**
-
-📄 **Paper**: [Link to paper / arXiv when available]  
-👤 **Authors**: [Author Names]  
-🏛️ **Affiliation**: [Institution]
+👤 **Authors**: [Xi Wang]  
+🏛️ **Affiliation**: [Lanzhou Jiaotong Univerisy]
 
 ## Overview
 
@@ -17,8 +14,8 @@ The analysis combines:
 - **Difference-in-Differences (DID)** modeling to identify the causal 
   effect of World Cup hosting on urban green space changes
 - **Parallel Trends Test** to validate the DID identifying assumption
-- **IFCI ([full name to be specified])** estimation as a complementary 
-  measure for [briefly describe what IFCI captures in this context]
+- **IFCI** estimation as a complementary 
+  measure for [The Overall Fragmentation Level of Urban Green Spaces in the Host City]
 
 By comparing host cities with comparable non-host cities before and after 
 World Cup events, this study provides empirical evidence on how mega-sports 
@@ -60,14 +57,11 @@ pip install -r requirements.txt
 ### Data Sources
 The dataset is fully open and included in this repository under `./data/`.
 
-- **Green space data**: [e.g., Landsat NDVI / MODIS / urban green space 
-  statistics from XXX database]
-- **City-level covariates**: [e.g., population, GDP, urbanization rate 
-  from World Bank / UN-Habitat / national statistics]
+- **Green space data**
+- **City-level covariates**
 - **World Cup hosting records**: FIFA official records
 - **Time period**: [e.g., 1990–2022]
-- **Geographic coverage**: [e.g., XX host cities and XX control cities 
-  worldwide]
+- **Geographic coverage**
 
 ### Data Structure
 Required columns in `panel_data.csv`:
@@ -124,20 +118,6 @@ python code_IFCI.py
 
 Parallel trends test: passed (p > 0.10 for all pre-treatment periods).
 
-## Citation
-
-If you use this code in your research, please cite:
-
-```bibtex
-@article{wang2026worldcup,
-  title   = {[Your Paper Title]},
-  author  = {Wang, X. and [Co-authors]},
-  journal = {[Journal Name]},
-  year    = {2026},
-  doi     = {[DOI]}
-}
-```
-
 ## License
 
 This project is licensed under the Apache License 2.0 — see the 
@@ -147,7 +127,7 @@ This project is licensed under the Apache License 2.0 — see the
 
 For questions or issues regarding this code:
 - 🐛 **Bug reports**: Open an [issue](https://github.com/WangXGeo/code_World_Cup/issues)
-- 📧 **Email**: [your-email@example.com]
+- 📧 **Email**: [13230094@stu.lzjtu.edu.cn]
 
 ## Acknowledgments
 
